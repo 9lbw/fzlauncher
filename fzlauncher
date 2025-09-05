@@ -26,50 +26,28 @@ def strip_field_codes(cmd: str) -> str:
     return cmd if idx == -1 else cmd[:idx]
 
 
-def fast_parse_mmap(path: Path) -> dict[str, str] | None:
-    name = exec_ = None
-    no_display = False
-    
-    try:
-        with path.open("rb") as fh:
-            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                for line in iter(mm.readline, b""):
-                    line = line.rstrip()
-                    if line == b"[Desktop Entry]":
-                        continue
-                    if line.startswith(b"NoDisplay=true"):
-                        no_display = True
-                    elif line.startswith(b"Name=") and name is None:
-                        name = line[5:].decode("utf-8", "replace")
-                    elif line.startswith(b"Exec=") and exec_ is None:
-                        exec_ = line[5:].decode("utf-8", "replace")
-                    if name and exec_ and no_display:
-                        return None
-    except Exception:
-        return None
-
-    if not name or not exec_ or no_display:
-        return None
-    return {"name": name, "exec": strip_field_codes(exec_)}
-
-
 def fast_parse(path: Path) -> dict[str, str] | None:
     name = exec_ = None
     no_display = False
 
-    with path.open("rb") as fh:
-        for raw in fh:
-            line = raw.rstrip()
-            if line == b"[Desktop Entry]":
-                continue
-            if line.startswith(b"NoDisplay=true"):
-                no_display = True
-            elif line.startswith(b"Name=") and name is None:
-                name = line[5:].decode("utf-8", "replace")
-            elif line.startswith(b"Exec=") and exec_ is None:
-                exec_ = line[5:].decode("utf-8", "replace")
-            if name and exec_ and no_display:
-                return None
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                line = raw.rstrip()
+                if line == b"[Desktop Entry]":
+                    continue
+                if line.startswith(b"NoDisplay=true"):
+                    no_display = True
+                elif line.startswith(b"Name=") and name is None:
+                    name = line[5:].decode("utf-8", "replace")
+                elif line.startswith(b"Exec=") and exec_ is None:
+                    exec_ = line[5:].decode("utf-8", "replace")
+                if name and exec_ and no_display:
+                    return None
+    except Exception as e:
+        if os.getenv("DEBUG"):
+            print(f"Parse error in {path}: {e}", file=sys.stderr)
+        return None
 
     if not name or not exec_ or no_display:
         return None
@@ -94,9 +72,15 @@ def cache_still_valid() -> bool:
         return False
     
     try:
-        cache_mtime = CACHE_FILE.stat().st_mtime
+        stamp_data = json.loads(STAMP_FILE.read_text())
+        cache_mtime_ns = stamp_data.get("cache_mtime_ns")
+        if cache_mtime_ns is None:
+            return False
+
         for path in get_desktop_files_cached():
-            if path.stat().st_mtime > cache_mtime:
+            if not path.is_file():  # safety
+                continue
+            if path.stat().st_mtime_ns > cache_mtime_ns:
                 return False
         return True
     except Exception:
@@ -106,32 +90,24 @@ def cache_still_valid() -> bool:
 def write_cache(apps: dict[str, str]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(apps, ensure_ascii=False))
-    stamp = {"cache_mtime": CACHE_FILE.stat().st_mtime}
+    stamp = {"cache_mtime_ns": CACHE_FILE.stat().st_mtime_ns}
     STAMP_FILE.write_text(json.dumps(stamp))
 
 
 def build_cache_parallel() -> dict[str, str]:
     files = get_desktop_files_cached()
+    max_workers = min(32, (os.cpu_count() or 1) * 2)
     
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        results = []
-        for path in files:
-            try:
-                if path.stat().st_size > 1024:
-                    results.append(pool.submit(fast_parse_mmap, path))
-                else:
-                    results.append(pool.submit(fast_parse, path))
-            except Exception:
-                continue
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(fast_parse, path) for path in files if path.is_file()]
         
         apps = {}
-        for future in as_completed(results):
+        for future in as_completed(futures):
             try:
                 if data := future.result():
                     apps[data["name"]] = data["exec"]
             except Exception:
                 continue
-    
     return apps
 
 
