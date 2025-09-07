@@ -185,23 +185,32 @@ class AppCache:
 def select_with_fzf(apps: dict[str, dict]) -> str | None:
     app_names = "\n".join(sorted(apps.keys()))
 
-    fzf_cmd = """
+    fzf_cmd_with_colors = """
 [ -f ~/.cache/wal/colors-fzf.sh ] && . ~/.cache/wal/colors-fzf.sh
 fzf --margin=0 --padding=0 --prompt='Launch: '
 """
-    try:
-        proc = subprocess.run(
-            ["bash", "-c", fzf_cmd],
-            input=app_names,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return proc.stdout.strip() or None
-    except subprocess.CalledProcessError as e:
-        if e.returncode != 130:  # 130 = Ctrl+C
-            print(f"fzf failed: {e}", file=sys.stderr)
-        return None
+    
+    fzf_cmd_plain = "fzf --margin=0 --padding=0 --prompt='Launch: '"
+    
+    for cmd in [fzf_cmd_with_colors, fzf_cmd_plain]:
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", cmd],
+                input=app_names,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return proc.stdout.strip() or None
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 130:  # Ctrl+C
+                return None
+            if os.getenv("DEBUG"):
+                print(f"fzf command failed: {cmd}, error: {e}", file=sys.stderr)
+            continue
+    
+    print("fzf failed: Command not found or configuration error", file=sys.stderr)
+    return None
 
 
 def launch(name: str, apps: dict[str, dict]) -> None:
