@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -15,7 +16,7 @@ APP_DIRS = [
     Path(os.path.expanduser("~/.local/share/applications")),
 ]
 
-CACHE_DIR = Path(os.path.expanduser("~/.cache/python_app_launcher"))
+CACHE_DIR = Path(os.path.expanduser("~/.cache/fzlauncher"))
 CACHE_FILE = CACHE_DIR / "apps.json"
 STAMP_FILE = CACHE_DIR / "stamp.json"
 
@@ -28,32 +29,41 @@ def strip_field_codes(cmd: str) -> str:
 def fast_parse(path: Path) -> dict[str, str] | None:
     name = exec_ = None
     no_display = False
+    is_desktop_entry = False
 
     try:
-        with path.open("rb") as fh:
-            for raw in fh:
-                line = raw.rstrip()
-                if line == b"[Desktop Entry]":
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if line == "[Desktop Entry]":
+                    is_desktop_entry = True
                     continue
-                if line.startswith(b"NoDisplay=true"):
+
+                if not is_desktop_entry:
+                    continue
+
+                if line.startswith("NoDisplay=true"):
                     no_display = True
-                elif line.startswith(b"Name=") and name is None:
-                    name = line[5:].decode("utf-8", "replace")
-                elif line.startswith(b"Exec=") and exec_ is None:
-                    exec_ = line[5:].decode("utf-8", "replace")
-                if name and exec_ and no_display:
-                    return None
+                    break
+                elif line.startswith("Name=") and name is None:
+                    name = line[5:]
+                elif line.startswith("Exec=") and exec_ is None:
+                    exec_ = line[5:]
+
     except Exception as e:
         if os.getenv("DEBUG"):
             print(f"Parse error in {path}: {e}", file=sys.stderr)
         return None
 
-    if not name or not exec_ or no_display:
+    if not all([is_desktop_entry, name, exec_]) or no_display:
         return None
+
+    # fucking type checking
+    assert name is not None and exec_ is not None
     return {"name": name, "exec": strip_field_codes(exec_)}
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=1)
 def get_desktop_files_cached() -> tuple[Path, ...]:
     files: list[Path] = []
     for path in APP_DIRS:
@@ -62,26 +72,15 @@ def get_desktop_files_cached() -> tuple[Path, ...]:
     return tuple(files)
 
 
-def get_desktop_files() -> list[Path]:
-    return list(get_desktop_files_cached())
-
-
 def cache_still_valid() -> bool:
     if not (CACHE_FILE.exists() and STAMP_FILE.exists()):
         return False
-    
+
     try:
         stamp_data = json.loads(STAMP_FILE.read_text())
-        cache_mtime_ns = stamp_data.get("cache_mtime_ns")
-        if cache_mtime_ns is None:
-            return False
+        latest_mtime = max(p.stat().st_mtime_ns for p in APP_DIRS if p.exists())
 
-        for path in get_desktop_files_cached():
-            if not path.is_file():  # safety
-                continue
-            if path.stat().st_mtime_ns > cache_mtime_ns:
-                return False
-        return True
+        return stamp_data.get("source_mtime_ns") == latest_mtime
     except Exception:
         return False
 
@@ -89,22 +88,29 @@ def cache_still_valid() -> bool:
 def write_cache(apps: dict[str, str]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(apps, ensure_ascii=False))
-    stamp = {"cache_mtime_ns": CACHE_FILE.stat().st_mtime_ns}
-    STAMP_FILE.write_text(json.dumps(stamp))
+
+    try:
+        latest_mtime = max(p.stat().st_mtime_ns for p in APP_DIRS if p.exists())
+        stamp = {"source_mtime_ns": latest_mtime}
+        STAMP_FILE.write_text(json.dumps(stamp))
+    except Exception as e:
+        if os.getenv("DEBUG"):
+            print(f"Could not write cache stamp: {e}", file=sys.stderr)
 
 
 def build_cache_parallel() -> dict[str, str]:
     files = get_desktop_files_cached()
     max_workers = min(32, (os.cpu_count() or 1) * 2)
-    
+
+    apps = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(fast_parse, path) for path in files if path.is_file()]
-        
-        apps = {}
-        for future in as_completed(futures):
+        future_to_path = {pool.submit(fast_parse, path): path for path in files if path.is_file()}
+
+        for future in as_completed(future_to_path):
             try:
                 if data := future.result():
-                    apps[data["name"]] = data["exec"]
+                    if data["name"] not in apps:
+                        apps[data["name"]] = data["exec"]
             except Exception:
                 continue
     return apps
@@ -113,32 +119,33 @@ def build_cache_parallel() -> dict[str, str]:
 class AppCache:
     def __init__(self):
         self._cache: dict[str, str] | None = None
-    
+
     def get(self) -> dict[str, str]:
         if self._cache is None:
             self._cache = self._build_app_cache()
         return self._cache
-    
+
     def _build_app_cache(self) -> dict[str, str]:
         if cache_still_valid():
             try:
                 return json.loads(CACHE_FILE.read_text())
             except Exception:
                 pass
-        
+
         apps = build_cache_parallel()
         write_cache(apps)
         return apps
-    
+
     def invalidate(self) -> None:
         self._cache = None
 
 
 def select_with_fzf(apps: dict[str, str]) -> str | None:
-    app_names = "\n".join(sorted(apps))
+    app_names = "\n".join(sorted(apps.keys()))
 
     fzf_cmd = """
 [ -f ~/.cache/wal/colors-fzf.sh ] && . ~/.cache/wal/colors-fzf.sh
+
 fzf --margin=0 --padding=0 --prompt='Launch: '
 """
     try:
@@ -156,25 +163,62 @@ fzf --margin=0 --padding=0 --prompt='Launch: '
         return None
 
 
+def _should_run_in_terminal(desktop_path: Path) -> bool:
+    try:
+        with desktop_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if line.strip() == "Terminal=true":
+                    return True
+    except Exception:
+        pass
+    return False
+
 def launch(name: str, apps: dict[str, str]) -> None:
+    if name not in apps:
+        print(f"Application '{name}' not found in cache.", file=sys.stderr)
+        return
+
     cmd = apps[name]
-    subprocess.run(
-        ["hyprctl", "dispatch", "exec", "--", cmd],
-        shell=False,
-        check=True,
-    )
+
+    desktop_file: Path | None = None
+    for app_dir in APP_DIRS:
+        for path in app_dir.rglob("*.desktop"):
+            data = fast_parse(path)
+            if data and data["name"] == name:
+                desktop_file = path
+                break
+        if desktop_file:
+            break
+
+    if desktop_file and _should_run_in_terminal(desktop_file):
+        term = shlex.split(os.getenv("TERMINAL") or "xterm -e")
+        args = term + shlex.split(cmd)
+    else:
+        args = shlex.split(cmd)
+
+    try:
+        subprocess.Popen(
+            args,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"Failed to launch '{name}' with command '{' '.join(args)}': {e}", file=sys.stderr)
 
 
 def main() -> None:
     app_cache = AppCache()
     apps = app_cache.get()
-    
+
     if not apps:
-        print("No applications found.", file=sys.stderr)
+        print("No applications found. Scanned directories:", file=sys.stderr)
+        for app_dir in APP_DIRS:
+            print(f"- {app_dir} (exists: {app_dir.exists()})", file=sys.stderr)
         return
 
-    if selected := select_with_fzf(apps):
-        launch(selected, apps)
+    if selected_app := select_with_fzf(apps):
+        launch(selected_app, apps)
 
 
 if __name__ == "__main__":
